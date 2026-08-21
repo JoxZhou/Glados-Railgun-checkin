@@ -338,7 +338,7 @@ class PushService:
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
-        if not self.config.push_key:
+        if not self.config or not hasattr(self.config, "push_key") or not self.config.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
             return False
 
@@ -451,6 +451,8 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    config = None
+    need_push = True  # 默认异常/配置错误时推送，便于及时发现问题
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -459,6 +461,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
+            need_push = True
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -470,14 +473,22 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            # 仅在签到失败时推送，成功/重复不再通知
+            fail_count = sum(1 for r in checker.get_results() if r["code"] == CheckinStatus.FAILURE)
+            need_push = fail_count > 0
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        need_push = True
 
-    # 4. 发送推送
+    # 4. 发送推送（按需）
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    push_service = PushService(config if config is not None else "")
+    if need_push:
+        push_service.send(title, content)
+    else:
+        logger.info(f"{LogEmoji.SUCCESS} 所有签到均成功（或仅重复），按配置跳过推送通知。")
     logger.info(f"{LogEmoji.END} 签到完成")
 
 
