@@ -324,7 +324,6 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
-    retried: bool = False  # 第一次签到失败后是否进行了第二次签到(重试)
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -391,12 +390,25 @@ class Checker:
                 self.results.append(result)
 
                 result_message = f"结果: {result.status}"
-                if result.code == CheckinStatus.SUCCESS:
+                if result.code == CheckinStatus.SUCCESS.value:
                     if self.config.verbose:
                         result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
                     self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
+                    # 成功即短路：该 Cookie 已签到完成，跳过其剩余域名
+                    logger.info(f"{LogEmoji.SUCCESS} Cookie {cookie_idx} 于 {domain} 签到成功，跳过该 Cookie 的后续域名。")
+                    break
+                elif result.code == CheckinStatus.REPEAT.value:
+                    if self.config.verbose:
+                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
+                    self._log(cookie_idx, domain, LogEmoji.REPEAT, result_message, force=True)
+                    # 重复签到（当日已签）视为完成，同样短路
+                    logger.info(f"{LogEmoji.REPEAT} Cookie {cookie_idx} 于 {domain} 重复签到，跳过该 Cookie 的后续域名。")
+                    break
                 else:
+                    if self.config.verbose:
+                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+                    # 失败：继续执行后面的签到（下一个域名）
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -407,23 +419,14 @@ class Checker:
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
 
-            # 2. 第一次签到
-            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行第一次签到")
+            # 2. 签到（单次尝试；失败由上层决定是否继续下一个域名）
+            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = self._normalize_code(checkin_result.get("code", CheckinStatus.FAILURE))
             result.points = checkin_result.get("points", "0")
 
-            # 3. 若第一次签到失败，进行第二次签到(重试)
-            if result.code == CheckinStatus.FAILURE.value:
-                self._log(cookie_idx, domain, LogEmoji.WARNING, "第一次签到失败，执行第二次签到(重试)", force=True)
-                checkin_result_2 = api.checkin(cookie)
-                result.status = checkin_result_2["status"]
-                result.code = self._normalize_code(checkin_result_2.get("code", CheckinStatus.FAILURE))
-                result.points = checkin_result_2.get("points", "0")
-                result.retried = True
-
-            # 4. 获取积分
+            # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
@@ -489,9 +492,9 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
-            # 仅当某服务第一次签到失败并进行了第二次签到(重试)时才推送；
-            # 第一次即成功/重复则不通知，推送内容为该次重试的最终结果(成功或失败)
-            need_push = any(r["retried"] for r in checker.get_results())
+            # 仅当本次运行出现过签到失败(并因此继续执行了后续签到)才推送汇总结果；
+            # 全部首次成功/重复则不通知
+            need_push = any(r["code"] == CheckinStatus.FAILURE.value for r in checker.get_results())
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
@@ -504,7 +507,7 @@ def main():
     if need_push:
         push_service.send(title, content)
     else:
-        logger.info(f"{LogEmoji.SUCCESS} 所有签到均首次成功（或仅重复），未触发重试，按配置跳过推送通知。")
+        logger.info(f"{LogEmoji.SUCCESS} 所有签到均成功（或重复），无失败，按配置跳过推送通知。")
     logger.info(f"{LogEmoji.END} 签到完成")
 
 
