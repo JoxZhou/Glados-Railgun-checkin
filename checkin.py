@@ -324,6 +324,7 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    retried: bool = False  # 第一次签到失败后是否进行了第二次签到(重试)
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -365,6 +366,11 @@ class Checker:
         if self.config.verbose or force:
             logger.info(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.DOMAIN}[{domain}] {emoji} {message}")
 
+    @staticmethod
+    def _normalize_code(code) -> int:
+        """将签到返回的 code 统一为 int（兼容 API 直接返回 int 与异常分支返回枚举两种情况）"""
+        return code.value if isinstance(code, CheckinStatus) else int(code)
+
     def checkin_all(self):
         """执行所有签到任务"""
         cookie_count = len(self.config.cookies_list)
@@ -401,13 +407,23 @@ class Checker:
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
 
-            # 2. 签到
-            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
+            # 2. 第一次签到
+            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行第一次签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
-            result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.code = self._normalize_code(checkin_result.get("code", CheckinStatus.FAILURE))
+            result.points = checkin_result.get("points", "0")
 
-            # 3. 获取积分
+            # 3. 若第一次签到失败，进行第二次签到(重试)
+            if result.code == CheckinStatus.FAILURE.value:
+                self._log(cookie_idx, domain, LogEmoji.WARNING, "第一次签到失败，执行第二次签到(重试)", force=True)
+                checkin_result_2 = api.checkin(cookie)
+                result.status = checkin_result_2["status"]
+                result.code = self._normalize_code(checkin_result_2.get("code", CheckinStatus.FAILURE))
+                result.points = checkin_result_2.get("points", "0")
+                result.retried = True
+
+            # 4. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
@@ -422,9 +438,9 @@ class Checker:
         """格式化结果"""
         results = self.get_results()
 
-        success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
-        repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
-        fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS.value)
+        repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT.value)
+        fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE.value)
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
 
@@ -473,9 +489,9 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
-            # 仅在签到失败时推送，成功/重复不再通知
-            fail_count = sum(1 for r in checker.get_results() if r["code"] == CheckinStatus.FAILURE)
-            need_push = fail_count > 0
+            # 仅当某服务第一次签到失败并进行了第二次签到(重试)时才推送；
+            # 第一次即成功/重复则不通知，推送内容为该次重试的最终结果(成功或失败)
+            need_push = any(r["retried"] for r in checker.get_results())
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
@@ -488,7 +504,7 @@ def main():
     if need_push:
         push_service.send(title, content)
     else:
-        logger.info(f"{LogEmoji.SUCCESS} 所有签到均成功（或仅重复），按配置跳过推送通知。")
+        logger.info(f"{LogEmoji.SUCCESS} 所有签到均首次成功（或仅重复），未触发重试，按配置跳过推送通知。")
     logger.info(f"{LogEmoji.END} 签到完成")
 
 
