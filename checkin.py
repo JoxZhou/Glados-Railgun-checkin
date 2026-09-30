@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+import sys
 import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -77,6 +78,19 @@ def log_method(func):
             raise
 
     return wrapper
+
+
+def is_auth_invalid(code: int, message: str) -> bool:
+    """判断是否为 Cookie 失效/未登录导致的鉴权失败（区别于网络错误/其他错误）"""
+    if code != CheckinStatus.FAILURE.value:
+        return False
+    msg = (message or "").lower()
+    keywords = [
+        "没有权限", "nopermission", "no permission",
+        "请先登录", "未登录", "not logged", "login required",
+        "unauthorized", "鉴权", "登录", "expired", "过期", "invalid",
+    ]
+    return any(k in msg for k in keywords)
 
 
 class Config:
@@ -231,6 +245,7 @@ class API:
             "points": "0",
             "message": "",
             "code": CheckinStatus.FAILURE,
+            "auth_invalid": False,
         }
 
         if response:
@@ -257,6 +272,8 @@ class API:
                 result["status"] = "签到失败"
                 result["points"] = "0"
                 result["message"] = message
+                # 鉴权失败（Cookie 失效/未登录）单独标记，便于后续给出明确修复指引
+                result["auth_invalid"] = is_auth_invalid(code, message)
         else:
             self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
             result["code"] = CheckinStatus.FAILURE
@@ -324,6 +341,8 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    auth_invalid: bool = False  # True 表示因 Cookie 失效/未登录导致失败
+    detail: str = ""
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -377,10 +396,16 @@ class Checker:
         total_tasks = cookie_count * domain_count
         task_idx = 0
 
+        # 记录每个 Cookie 是否被任一域名成功/重复签到覆盖；未被覆盖即视为该 Cookie 整体失败
+        self.cookie_covered = {i: False for i in range(1, cookie_count + 1)}
+        # 记录因 Cookie 失效（鉴权失败）而整体失败的 Cookie 序号
+        self.auth_invalid_cookies = []
+
         logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, {domain_count} 个域名, 共 {total_tasks} 个任务")
 
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
+            cookie_auth_invalid = False
 
             for domain in self.config.DOMAINS:
                 task_idx += 1
@@ -395,6 +420,7 @@ class Checker:
                         result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
                     self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
                     # 成功即短路：该 Cookie 已签到完成，跳过其剩余域名
+                    self.cookie_covered[cookie_idx] = True
                     logger.info(f"{LogEmoji.SUCCESS} Cookie {cookie_idx} 于 {domain} 签到成功，跳过该 Cookie 的后续域名。")
                     break
                 elif result.code == CheckinStatus.REPEAT.value:
@@ -402,13 +428,23 @@ class Checker:
                         result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
                     self._log(cookie_idx, domain, LogEmoji.REPEAT, result_message, force=True)
                     # 重复签到（当日已签）视为完成，同样短路
+                    self.cookie_covered[cookie_idx] = True
                     logger.info(f"{LogEmoji.REPEAT} Cookie {cookie_idx} 于 {domain} 重复签到，跳过该 Cookie 的后续域名。")
                     break
                 else:
+                    if result.auth_invalid:
+                        cookie_auth_invalid = True
                     if self.config.verbose:
                         result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}"
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
                     # 失败：继续执行后面的签到（下一个域名）
+
+            if not self.cookie_covered[cookie_idx] and cookie_auth_invalid:
+                self.auth_invalid_cookies.append(cookie_idx)
+
+    def has_failure(self) -> bool:
+        """是否存在整体失败的 Cookie（所有域名均失败）。存在则返回 True，供主流程决定是否以非零退出码结束。"""
+        return any(not covered for covered in self.cookie_covered.values())
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -425,6 +461,8 @@ class Checker:
             result.status = checkin_result["status"]
             result.code = self._normalize_code(checkin_result.get("code", CheckinStatus.FAILURE))
             result.points = checkin_result.get("points", "0")
+            result.auth_invalid = checkin_result.get("auth_invalid", False)
+            result.detail = checkin_result.get("message", "")
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
@@ -461,6 +499,17 @@ class Checker:
 
         content = "\n".join(send_content_lines)
         log_content = "\n".join(log_content_lines)
+
+        # 若存在 Cookie 失效（鉴权失败），在推送内容中追加明确的修复指引
+        if getattr(self, "auth_invalid_cookies", []):
+            idx_list = ", ".join(f"#{i}" for i in self.auth_invalid_cookies)
+            guidance = (
+                "\n\n⚠️ Cookie 已失效/未登录（接口返回鉴权失败），请重新登录 GLaDOS / Railgun 后，"
+                "在仓库 Settings -> Secrets -> GLADOS_COOKIES 更新最新 Cookie。"
+            )
+            content += guidance
+            title = f"[Cookie失效] {title} (失效: {idx_list})"
+
         return title, content, log_content
 
 
@@ -472,6 +521,7 @@ def main():
     """主函数"""
     config = None
     need_push = True  # 默认异常/配置错误时推送，便于及时发现问题
+    exit_code = 0
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -481,6 +531,7 @@ def main():
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
             need_push = True
+            exit_code = 1
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -492,6 +543,10 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            # 存在任一 Cookie 在所有域名均签到失败 -> 视为运行失败，job 以非零码退出（GitHub 会标红并邮件通知）
+            if checker.has_failure():
+                exit_code = 1
+                logger.error(f"{LogEmoji.ERROR} 存在签到失败的账号，将以非零退出码结束，便于在 Actions 中标记失败。")
             # 仅当本次运行出现过签到失败(并因此继续执行了后续签到)才推送汇总结果；
             # 全部首次成功/重复则不通知
             need_push = any(r["code"] == CheckinStatus.FAILURE.value for r in checker.get_results())
@@ -500,6 +555,7 @@ def main():
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
         need_push = True
+        exit_code = 1
 
     # 4. 发送推送（按需）
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
@@ -509,6 +565,7 @@ def main():
     else:
         logger.info(f"{LogEmoji.SUCCESS} 所有签到均成功（或重复），无失败，按配置跳过推送通知。")
     logger.info(f"{LogEmoji.END} 签到完成")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
