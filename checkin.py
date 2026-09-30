@@ -48,6 +48,18 @@ class LogEmoji:
     INFO = "ℹ️ "
 
 
+# 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
+# GLaDOS 自 2026-09 起对签到请求做设备/UA 校验：UA 与登录设备不一致会返回
+# code:4 reason:device-mismatch（"Automated check-in detected"），需伪装成登录设备的 UA 才能签到成功。
+PLATFORM_UA = {
+    "Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "macOS": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "iPhone": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+}
+
+
 def log_method(func):
     """日志装饰器"""
 
@@ -99,9 +111,9 @@ def is_auth_invalid(code: int, message: str) -> bool:
 def analyze_cookie(cookie_str: str) -> Dict[str, object]:
     """
     本地预检 Cookie，无需请求接口即可发现明显问题（根本解决“签到静默失败”难排查）：
-    - koa:sess 是否可解码、是否含过期时间
+    - koa:sess / gld:sess 是否可解码、是否含过期时间（GLaDOS 2026-09 起改用 gld:sess）
     - 是否已过期
-    - koa:sess.sig 是否疑似被截断（标准 HMAC-SHA256 签名 base64url 约 43 字符）
+    - koa:sess.sig / gld:sess.sig 是否疑似被截断（标准 HMAC-SHA256 签名 base64url 约 43 字符）
     返回字段：valid_format / expired / sig_suspicious / user_id / expire_dt / note
     """
     info = {
@@ -112,29 +124,31 @@ def analyze_cookie(cookie_str: str) -> Dict[str, object]:
         "expire_dt": None,
         "note": "",
     }
-    if not cookie_str or "koa:sess=" not in cookie_str:
-        info["note"] = "Cookie 缺少 koa:sess 字段"
+    if not cookie_str:
+        info["note"] = "Cookie 为空"
         return info
 
     parts = [p.strip() for p in cookie_str.split(";") if p.strip()]
     sess = sig = None
     for p in parts:
-        if p.startswith("koa:sess=") and sess is None:
-            sess = p[len("koa:sess="):]
-        elif p.startswith("koa:sess.sig=") and sig is None:
-            sig = p[len("koa:sess.sig="):]
+        # 优先取会话段（koa:sess 或 gld:sess，二选一即可用于解码过期时间）
+        if sess is None and (p.startswith("koa:sess=") or p.startswith("gld:sess=")):
+            sess = p.split("=", 1)[1] if "=" in p else ""
+        # 取签名段（koa:sess.sig 或 gld:sess.sig）
+        elif sig is None and (p.startswith("koa:sess.sig=") or p.startswith("gld:sess.sig=")):
+            sig = p.split("=", 1)[1] if "=" in p else ""
 
     if not sess:
-        info["note"] = "未能解析出 koa:sess 值"
+        info["note"] = "Cookie 缺少 koa:sess / gld:sess 字段"
         return info
 
     # 1) 检测签名是否疑似被截断（最常见的“复制不全”导致签到失败的原因）
     if sig is None:
         info["sig_suspicious"] = True
-        info["note"] = "缺少 koa:sess.sig，Cookie 不完整"
+        info["note"] = "缺少 *_sess.sig，Cookie 不完整"
     elif len(sig) < 30:
         info["sig_suspicious"] = True
-        info["note"] = f"koa:sess.sig 疑似被截断（长度 {len(sig)}，正常约 43），请复制完整 Cookie"
+        info["note"] = f"sig 疑似被截断（长度 {len(sig)}，正常约 43），请复制完整 Cookie"
 
     # 2) 解码 payload 并检查过期时间
     try:
@@ -153,7 +167,7 @@ def analyze_cookie(cookie_str: str) -> Dict[str, object]:
                     "请重新登录 GLaDOS / Railgun 并更新"
                 )
     except Exception as e:
-        info["note"] = f"koa:sess 解码失败（可能不是有效的 GLaDOS Cookie）: {e}"
+        info["note"] = f"会话段解码失败（可能不是有效的 GLaDOS/Railgun Cookie）: {e}"
 
     return info
 
@@ -225,6 +239,7 @@ class API:
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
         self.headers: Dict[str, str] = self._get_headers()
+        self._device_ua_cache: Dict[str, str] = {}  # 记忆本次运行学得的设备 UA
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
@@ -273,9 +288,11 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", retries: int = 2) -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", retries: int = 2, user_agent: Optional[str] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求（带简单退避重试，提升对偶发网络抖动/5xx/限流的鲁棒性）"""
         session_headers = self.headers.copy()
+        if user_agent:
+            session_headers["user-agent"] = user_agent
         session_headers["cookie"] = cookies
         retryable = (500, 502, 503, 504, 429)
 
@@ -314,11 +331,48 @@ class API:
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到"""
+        """执行签到，含设备平台自适应重试（应对 GLaDOS 反爬：code 4 device-mismatch）"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
-        response = self._make_request(url, "POST", checkin_data, cookies)
 
+        # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
+        start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
+        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+
+        # 设备不匹配(code 4 / reason:device-mismatch)时，按服务端 loginDevice 切换 UA 重试一次
+        if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
+            if recover_ua and recover_ua != start_ua:
+                self._log("warning", LogEmoji.WARNING,
+                          f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
+                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
+
+        return self._parse_checkin(raw)
+
+    def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
+        """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
+        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        if not response:
+            return None
+        try:
+            raw = response.json()
+        except ValueError:
+            self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
+            return None
+
+        # 缓存学得的设备 UA，供本次运行后续请求复用
+        if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            if login_device in PLATFORM_UA:
+                self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
+        elif raw.get("code") in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
+            self._device_ua_cache["_last"] = user_agent
+
+        return raw
+
+    def _parse_checkin(self, raw: Optional[Dict]) -> Dict[str, Union[str, CheckinStatus]]:
+        """解析签到响应为结果字典"""
         result = {
             "status": "签到失败",
             "points": "0",
@@ -327,37 +381,34 @@ class API:
             "auth_invalid": False,
         }
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
+        if not raw:
+            result["message"] = "网络请求失败"
+            return result
 
-            if code == CheckinStatus.SUCCESS.value:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
-                result["code"] = CheckinStatus.SUCCESS
-                result["status"] = "签到成功"
-                result["points"] = points
-                result["message"] = message
-            elif code == CheckinStatus.REPEAT.value:
-                self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.REPEAT
-                result["status"] = "重复签到"
-                result["points"] = "0"
-                result["message"] = message
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.FAILURE
-                result["status"] = "签到失败"
-                result["points"] = "0"
-                result["message"] = message
-                # 鉴权失败（Cookie 失效/未登录）单独标记，便于后续给出明确修复指引
-                result["auth_invalid"] = is_auth_invalid(code, message)
+        code = raw.get("code", -2)
+        message = raw.get("message", "无消息字段")
+        points = str(raw.get("points", 0))
+
+        if code == CheckinStatus.SUCCESS.value:
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
+            result["code"] = CheckinStatus.SUCCESS
+            result["status"] = "签到成功"
+            result["points"] = points
+            result["message"] = message
+        elif code == CheckinStatus.REPEAT.value:
+            self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
+            result["code"] = CheckinStatus.REPEAT
+            result["status"] = "重复签到"
+            result["points"] = "0"
+            result["message"] = message
         else:
-            self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
-            result["message"] = "网络请求失败"
+            result["points"] = "0"
+            result["message"] = message
+            # 鉴权失败（Cookie 失效/未登录）单独标记，便于后续给出明确修复指引
+            result["auth_invalid"] = is_auth_invalid(code, message)
 
         return result
 
