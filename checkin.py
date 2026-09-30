@@ -113,7 +113,8 @@ def analyze_cookie(cookie_str: str) -> Dict[str, object]:
     本地预检 Cookie，无需请求接口即可发现明显问题（根本解决“签到静默失败”难排查）：
     - koa:sess / gld:sess 是否可解码、是否含过期时间（GLaDOS 2026-09 起改用 gld:sess）
     - 是否已过期
-    - koa:sess.sig / gld:sess.sig 是否疑似被截断（标准 HMAC-SHA256 签名 base64url 约 43 字符）
+    - koa:sess.sig / gld:sess.sig 是否疑似被截断（GLaDOS/Railgun 使用 HMAC-SHA1 签名，
+      base64 后约 26~28 字符；真正被截断的 sig 通常远短于此，如只剩若干字符）
     返回字段：valid_format / expired / sig_suspicious / user_id / expire_dt / note
     """
     info = {
@@ -143,12 +144,14 @@ def analyze_cookie(cookie_str: str) -> Dict[str, object]:
         return info
 
     # 1) 检测签名是否疑似被截断（最常见的“复制不全”导致签到失败的原因）
+    #    GLaDOS/Railgun 使用 HMAC-SHA1 签名，base64 后正常约 26~28 字符；
+    #    真正被截断的 sig 通常明显偏短（<16 字符），不要把正常长度误判为截断。
     if sig is None:
         info["sig_suspicious"] = True
         info["note"] = "缺少 *_sess.sig，Cookie 不完整"
-    elif len(sig) < 30:
+    elif len(sig) < 16:
         info["sig_suspicious"] = True
-        info["note"] = f"sig 疑似被截断（长度 {len(sig)}，正常约 43），请复制完整 Cookie"
+        info["note"] = f"sig 疑似被截断（长度 {len(sig)}，正常约 26~28），请复制完整 Cookie"
 
     # 2) 解码 payload 并检查过期时间
     try:
