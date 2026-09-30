@@ -2,7 +2,10 @@ import requests
 import json
 import os
 import sys
+import time
+import base64
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -91,6 +94,69 @@ def is_auth_invalid(code: int, message: str) -> bool:
         "unauthorized", "鉴权", "登录", "expired", "过期", "invalid",
     ]
     return any(k in msg for k in keywords)
+
+
+def analyze_cookie(cookie_str: str) -> Dict[str, object]:
+    """
+    本地预检 Cookie，无需请求接口即可发现明显问题（根本解决“签到静默失败”难排查）：
+    - koa:sess 是否可解码、是否含过期时间
+    - 是否已过期
+    - koa:sess.sig 是否疑似被截断（标准 HMAC-SHA256 签名 base64url 约 43 字符）
+    返回字段：valid_format / expired / sig_suspicious / user_id / expire_dt / note
+    """
+    info = {
+        "valid_format": False,
+        "expired": False,
+        "sig_suspicious": False,
+        "user_id": None,
+        "expire_dt": None,
+        "note": "",
+    }
+    if not cookie_str or "koa:sess=" not in cookie_str:
+        info["note"] = "Cookie 缺少 koa:sess 字段"
+        return info
+
+    parts = [p.strip() for p in cookie_str.split(";") if p.strip()]
+    sess = sig = None
+    for p in parts:
+        if p.startswith("koa:sess=") and sess is None:
+            sess = p[len("koa:sess="):]
+        elif p.startswith("koa:sess.sig=") and sig is None:
+            sig = p[len("koa:sess.sig="):]
+
+    if not sess:
+        info["note"] = "未能解析出 koa:sess 值"
+        return info
+
+    # 1) 检测签名是否疑似被截断（最常见的“复制不全”导致签到失败的原因）
+    if sig is None:
+        info["sig_suspicious"] = True
+        info["note"] = "缺少 koa:sess.sig，Cookie 不完整"
+    elif len(sig) < 30:
+        info["sig_suspicious"] = True
+        info["note"] = f"koa:sess.sig 疑似被截断（长度 {len(sig)}，正常约 43），请复制完整 Cookie"
+
+    # 2) 解码 payload 并检查过期时间
+    try:
+        pad = sess + "=" * (-len(sess) % 4)
+        data = json.loads(base64.b64decode(pad))
+        info["valid_format"] = True
+        info["user_id"] = data.get("userId") or data.get("userID")
+        exp = data.get("_expire") or data.get("expire") or data.get("_expires")
+        if exp is not None:
+            exp_s = exp / 1000.0 if exp > 1e12 else float(exp)
+            info["expire_dt"] = datetime.fromtimestamp(exp_s, tz=timezone.utc)
+            if info["expire_dt"].timestamp() < time.time():
+                info["expired"] = True
+                info["note"] = (
+                    f"Cookie 已于 {info['expire_dt'].strftime('%Y-%m-%d %H:%M UTC')} 过期，"
+                    "请重新登录 GLaDOS / Railgun 并更新"
+                )
+    except Exception as e:
+        info["note"] = f"koa:sess 解码失败（可能不是有效的 GLaDOS Cookie）: {e}"
+
+    return info
+
 
 
 class Config:
@@ -207,27 +273,40 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
-        """发送 HTTP 请求"""
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", retries: int = 2) -> Optional[requests.Response]:
+        """发送 HTTP 请求（带简单退避重试，提升对偶发网络抖动/5xx/限流的鲁棒性）"""
         session_headers = self.headers.copy()
         session_headers["cookie"] = cookies
+        retryable = (500, 502, 503, 504, 429)
 
-        try:
-            if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=json.dumps(data), timeout=(60, 120))
-            elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
-            else:
-                self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
-                return None
+        for attempt in range(retries + 1):
+            try:
+                if method.upper() == "POST":
+                    response = self.session.post(url, headers=session_headers, data=json.dumps(data), timeout=(60, 120))
+                elif method.upper() == "GET":
+                    response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                else:
+                    self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
+                    return None
 
-            if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                if not response.ok:
+                    if response.status_code in retryable and attempt < retries:
+                        self._log("warning", LogEmoji.WARNING,
+                                  f"请求 {url} 返回 {response.status_code}，{attempt + 1}/{retries} 后重试", force=True)
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                    return None
+                return response
+            except requests.exceptions.RequestException as e:
+                if attempt < retries:
+                    self._log("warning", LogEmoji.WARNING,
+                              f"向 {url} 请求发生网络错误: {e}，{attempt + 1}/{retries} 后重试", force=True)
+                    time.sleep((attempt + 1) * 2)
+                    continue
+                self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
                 return None
-            return response
-        except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
-            return None
+        return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
         """获取签到数据"""
@@ -407,6 +486,23 @@ class Checker:
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
             cookie_auth_invalid = False
 
+            # 本地预检：过期 / 签名被截断 直接判定失效，避免无效网络请求并给出精准提示
+            pre = analyze_cookie(cookie)
+            if pre["expired"] or pre["sig_suspicious"]:
+                detail = pre["note"] or "Cookie 预检未通过"
+                logger.error(f"{LogEmoji.ERROR} Cookie {cookie_idx} 预检失败: {detail}")
+                self.results.append(CheckinResult(
+                    cookie_index=cookie_idx,
+                    domain="预检",
+                    status="Cookie无效",
+                    code=CheckinStatus.FAILURE.value,
+                    auth_invalid=True,
+                    detail=detail,
+                ))
+                self.cookie_covered[cookie_idx] = False
+                self.auth_invalid_cookies.append(cookie_idx)
+                continue
+
             for domain in self.config.DOMAINS:
                 task_idx += 1
                 logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
@@ -450,12 +546,7 @@ class Checker:
         result = CheckinResult(cookie_idx, domain)
 
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            # 1. 获取状态
-            self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, status_code = api.get_status(cookie)
-            result.days = days_str
-
-            # 2. 签到（单次尝试；失败由上层决定是否继续下一个域名）
+            # 1. 优先执行签到（核心动作）
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
@@ -464,10 +555,15 @@ class Checker:
             result.auth_invalid = checkin_result.get("auth_invalid", False)
             result.detail = checkin_result.get("message", "")
 
-            # 3. 获取积分
-            self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
-            result.points_total = points_str
+            # 2. 仅当签到成功/重复时，才补充查询剩余天数与总积分（失败时不再浪费请求）
+            if result.code in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
+                self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
+                days_str, _ = api.get_status(cookie)
+                result.days = days_str
+
+                self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
+                points_str, _ = api.get_points(cookie)
+                result.points_total = points_str
 
         return result
 
@@ -504,8 +600,9 @@ class Checker:
         if getattr(self, "auth_invalid_cookies", []):
             idx_list = ", ".join(f"#{i}" for i in self.auth_invalid_cookies)
             guidance = (
-                "\n\n⚠️ Cookie 已失效/未登录（接口返回鉴权失败），请重新登录 GLaDOS / Railgun 后，"
-                "在仓库 Settings -> Secrets -> GLADOS_COOKIES 更新最新 Cookie。"
+                "\n\n⚠️ 存在 Cookie 失效/无效（接口鉴权失败或本地预检未通过），请重新登录 GLaDOS / Railgun，"
+                "复制【完整】Cookie（尤其是 koa:sess.sig 需完整、约 43 字符，切勿截断）后，"
+                "在仓库 Settings -> Secrets -> GLADOS_COOKIES 更新。"
             )
             content += guidance
             title = f"[Cookie失效] {title} (失效: {idx_list})"
