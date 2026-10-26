@@ -2,13 +2,19 @@ name: auto check
 
 on:
   workflow_dispatch:
+    inputs:
+      force_push:
+        description: '是否强制发送推送通知（默认 false 仅在失败/异常时通知）'
+        required: false
+        default: 'false'
   push:
     branches: [ master, main ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '0 4,10 * * *'
+    # UTC 20:00 和 02:00 对应北京时间 (UTC+8) 04:00 和 10:00
+    - cron: '0 2,20 * * *'
 
 jobs:
   build:
@@ -51,11 +57,14 @@ jobs:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        GLADOS_NOTIFY_ON_SUCCESS: ${{ github.event.inputs.force_push || secrets.GLADOS_NOTIFY_ON_SUCCESS }}
 
     - name: Keep alive
+      if: always()
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
+      if: always()
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}
